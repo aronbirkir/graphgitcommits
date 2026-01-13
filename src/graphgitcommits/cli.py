@@ -162,8 +162,8 @@ def get_git_commits(since: datetime | None = None) -> List[Tuple[str, datetime, 
             if len(parts) >= 2:
                 try:
                     # Handle binary files which show '-' instead of numbers
-                    additions = int(parts[0]) if parts[0] != '-' else 0
-                    deletions = int(parts[1]) if parts[1] != '-' else 0
+                    additions = int(parts[0]) if parts[0] != "-" else 0
+                    deletions = int(parts[1]) if parts[1] != "-" else 0
                     current_lines += additions + deletions
                 except ValueError:
                     pass
@@ -228,11 +228,12 @@ def aggregate_commits(
 def create_visualization(
     aggregated_commits: Dict[str, Dict[str, int]],
     aggregated_lines: Dict[str, Dict[str, int]],
+    commits: List[Tuple[str, datetime, int]],
     interval: str = "week",
     period: str | None = None,
     repo_name: str = "repo",
 ) -> None:
-    """Create visualizations of commits and lines changed by user and time interval."""
+    """Create a combined visualization with 4 tiles: commits, lines, trend, and stats table."""
     # Convert to DataFrames for easier plotting
     df = pd.DataFrame(aggregated_commits).T.fillna(0)
     df_lines = pd.DataFrame(aggregated_lines).T.fillna(0)
@@ -266,27 +267,38 @@ def create_visualization(
     df = df[author_totals.index]
     df_lines = df_lines[author_totals.index]  # Same order as commits
 
-    # Create legend labels with commit counts and lines
-    legend_labels = [
-        f"{author} ({int(author_totals[author]):,} commits, {int(author_lines_totals[author]):,} lines)"
-        for author in df.columns
-    ]
+    # Create consistent color map for authors
+    cmap = plt.cm.get_cmap("tab20")
+    author_colors = {author: cmap(i % 20) for i, author in enumerate(author_totals.index)}
+    color_list = [author_colors[author] for author in df.columns]
 
-    # Create figure
-    fig, ax = plt.subplots(figsize=(16, 8))
+    # Calculate average time between commits per author
+    author_commit_times: Dict[str, List[datetime]] = defaultdict(list)
+    for author, date, _ in commits:
+        author_commit_times[author].append(date)
 
-    # Plot stacked bar chart
-    df.plot(kind="bar", stacked=True, ax=ax, width=0.8)
+    avg_time_between: Dict[str, str] = {}
+    for author in author_totals.index:
+        times = sorted(author_commit_times.get(author, []))
+        if len(times) > 1:
+            deltas = [(times[i] - times[i - 1]).days for i in range(1, len(times))]
+            avg_days = sum(deltas) / len(deltas)
+            if avg_days < 1:
+                avg_time_between[author] = f"{avg_days * 24:.1f}h"
+            elif avg_days < 7:
+                avg_time_between[author] = f"{avg_days:.1f}d"
+            else:
+                avg_time_between[author] = f"{avg_days / 7:.1f}w"
+        else:
+            avg_time_between[author] = "N/A"
 
-    # Formatting
+    # Create 2x2 figure with widescreen ratio
+    fig = plt.figure(figsize=(24, 12))
+
+    # Use GridSpec for better control
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.2)
+
     interval_label = interval.capitalize()
-    ax.set_title(
-        f"{repo_name} - Git Commits by User and {interval_label}", fontsize=16, fontweight="bold"
-    )
-    ax.set_xlabel(f"{interval_label} Starting", fontsize=12)
-    ax.set_ylabel("Number of Commits", fontsize=12)
-    ax.legend(legend_labels, title="Authors", bbox_to_anchor=(1.05, 1), loc="upper left")
-    ax.grid(True, alpha=0.3, axis="y")
 
     # Format x-axis dates based on interval
     if interval == "week":
@@ -304,109 +316,162 @@ def create_visualization(
     else:
         labels = [d.strftime(date_format) for d in df.index]
 
-    ax.set_xticklabels(labels, rotation=45, ha="right")
+    n = max(1, len(df) // 20)  # Show roughly 20 labels
 
-    # Only show every nth label to avoid overcrowding
-    n = max(1, len(df) // 30)  # Show roughly 30 labels
-    for i, label in enumerate(ax.xaxis.get_ticklabels()):
+    # ===== Tile 1: Commit Count (top-left) =====
+    ax1 = fig.add_subplot(gs[0, 0])
+    df.plot(kind="bar", stacked=True, ax=ax1, width=0.8, legend=False, color=color_list)
+    ax1.set_title(f"Commits by {interval_label}", fontsize=14, fontweight="bold")
+    ax1.set_xlabel("")
+    ax1.set_ylabel("Commits", fontsize=10)
+    ax1.grid(True, alpha=0.3, axis="y")
+    ax1.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    for i, label in enumerate(ax1.xaxis.get_ticklabels()):
         if i % n != 0:
             label.set_visible(False)
 
-    plt.tight_layout()
+    # ===== Tile 2: Lines Changed (top-right) =====
+    ax2 = fig.add_subplot(gs[0, 1])
+    df_lines.plot(kind="bar", stacked=True, ax=ax2, width=0.8, legend=False, color=color_list)
+    ax2.set_title(f"Lines Changed by {interval_label}", fontsize=14, fontweight="bold")
+    ax2.set_xlabel("")
+    ax2.set_ylabel("Lines", fontsize=10)
+    ax2.grid(True, alpha=0.3, axis="y")
+    ax2.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    for i, label in enumerate(ax2.xaxis.get_ticklabels()):
+        if i % n != 0:
+            label.set_visible(False)
+
+    # ===== Tile 3: Commits Trend (bottom-left) =====
+    ax3 = fig.add_subplot(gs[1, 0])
+    for author in df.columns:
+        ax3.plot(
+            df.index,
+            df[author],
+            marker="o",
+            markersize=3,
+            linewidth=2,
+            label=author,
+            color=author_colors[author],
+        )
+    ax3.set_title("Commits Trend", fontsize=14, fontweight="bold")
+    ax3.set_xlabel(f"{interval_label}", fontsize=10)
+    ax3.set_ylabel("Commits", fontsize=10)
+    ax3.legend(fontsize=8, loc="upper left")
+    ax3.grid(True, alpha=0.3)
+
+    # Format x-axis
+    if interval == "year":
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    elif interval == "quarter":
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    elif interval == "month":
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    else:
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha="right", fontsize=8)
+
+    # ===== Tile 4: Stats Table (bottom-right) =====
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.axis("off")
+
+    # Calculate number of months in the date range for avg lines/month
+    date_range_days = (df.index.max() - df.index.min()).days
+    num_months = max(1, date_range_days / 30.44)  # Average days per month
+
+    # Build table data with color indicator
+    table_data = []
+    for author in author_totals.index:
+        commit_count = int(author_totals[author])
+        line_count = int(author_lines_totals[author])
+        avg_lines = line_count // commit_count if commit_count > 0 else 0
+        avg_lines_month = int(line_count / num_months)
+        avg_time = avg_time_between[author]
+        table_data.append(
+            ["", author, f"{commit_count:,}", f"{line_count:,}", f"{avg_lines:,}", f"{avg_lines_month:,}", avg_time]
+        )
+
+    # Add totals row
+    total_commits = int(df.sum().sum())
+    total_lines = int(df_lines.sum().sum())
+    avg_lines_total = total_lines // total_commits if total_commits > 0 else 0
+    avg_lines_month_total = int(total_lines / num_months)
+    table_data.append(
+        [
+            "",
+            "TOTAL",
+            f"{total_commits:,}",
+            f"{total_lines:,}",
+            f"{avg_lines_total:,}",
+            f"{avg_lines_month_total:,}",
+            "—",
+        ]
+    )
+
+    col_labels = ["", "Author", "Commits", "Lines", "Lines/Commit", "Lines/Month", "Time Between"]
+
+    table = ax4.table(
+        cellText=table_data,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+        colWidths=[0.04, 0.19, 0.11, 0.14, 0.16, 0.16, 0.20],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.1, 1.5)
+
+    # Style the header row
+    for i in range(len(col_labels)):
+        table[(0, i)].set_facecolor("#4472C4")
+        table[(0, i)].set_text_props(color="white", fontweight="bold")
+
+    # Set column alignments: author left-aligned, numbers right-aligned
+    for row_idx in range(len(table_data) + 1):  # +1 for header
+        # Column 1 (Author) - left align
+        table[(row_idx, 1)].get_text().set_ha("left")
+        # Columns 2-6 (numbers) - right align
+        for col_idx in range(2, 7):
+            table[(row_idx, col_idx)].get_text().set_ha("right")
+
+    # Style author rows with their colors in the first column
+    for row_idx, author in enumerate(author_totals.index, start=1):
+        table[(row_idx, 0)].set_facecolor(author_colors[author])
+
+    # Style the totals row
+    for i in range(len(col_labels)):
+        table[(len(table_data), i)].set_facecolor("#E2EFDA")
+        table[(len(table_data), i)].set_text_props(fontweight="bold")
+
+    ax4.set_title("Contributor Statistics", fontsize=14, fontweight="bold", pad=20)
+
+    # Add overall title
+    period_text = f" ({period})" if period else " (all time)"
+    fig.suptitle(f"{repo_name} - Git Activity{period_text}", fontsize=18, fontweight="bold", y=0.98)
 
     # Build filename with parameters
     period_str = f"_{period}" if period else "_all"
     filename_base = f"{repo_name}_commits_{interval}{period_str}"
 
-    # Save the figure
-    output_file = f"{filename_base}.png"
+    # Save the combined figure
+    output_file = f"{filename_base}_dashboard.png"
     plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    print(f"\n✓ Graph saved to {output_file}")
-
-    # Also create a line chart for trends
-    fig2, ax2 = plt.subplots(figsize=(16, 8))
-
-    # Plot each author's line explicitly with proper x values
-    for i, author in enumerate(df.columns):
-        ax2.plot(
-            df.index, df[author], marker="o", markersize=3, linewidth=2, label=legend_labels[i]
-        )
-
-    ax2.set_title(
-        f"{repo_name} - Git Commits Trend by User and {interval_label}", fontsize=16, fontweight="bold"
-    )
-    ax2.set_xlabel(f"{interval_label} Starting", fontsize=12)
-    ax2.set_ylabel("Number of Commits", fontsize=12)
-    ax2.legend(title="Authors", bbox_to_anchor=(1.05, 1), loc="upper left")
-    ax2.grid(True, alpha=0.3)
-
-    # Format x-axis based on interval
-    if interval == "year":
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        ax2.xaxis.set_major_locator(mdates.YearLocator())
-    elif interval == "quarter":
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    elif interval == "month":
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        month_interval = max(1, len(df) // 12)
-        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=month_interval))
-    else:  # week
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-
-    # Set proper date limits
-    ax2.set_xlim(df.index.min(), df.index.max())
-
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha="right")
-
-    plt.tight_layout()
-
-    output_file2 = f"{filename_base}_trend.png"
-    plt.savefig(output_file2, dpi=300, bbox_inches="tight")
-    print(f"✓ Trend graph saved to {output_file2}")
-
-    # Create a stacked bar chart for lines changed
-    fig3, ax3 = plt.subplots(figsize=(16, 8))
-
-    # Plot stacked bar chart for lines
-    df_lines.plot(kind="bar", stacked=True, ax=ax3, width=0.8)
-
-    ax3.set_title(
-        f"{repo_name} - Lines Changed by User and {interval_label}", fontsize=16, fontweight="bold"
-    )
-    ax3.set_xlabel(f"{interval_label} Starting", fontsize=12)
-    ax3.set_ylabel("Lines Changed", fontsize=12)
-    ax3.legend(legend_labels, title="Authors", bbox_to_anchor=(1.05, 1), loc="upper left")
-    ax3.grid(True, alpha=0.3, axis="y")
-
-    # Create x-axis labels (same as commits chart)
-    ax3.set_xticklabels(labels, rotation=45, ha="right")
-
-    # Only show every nth label
-    for i, label in enumerate(ax3.xaxis.get_ticklabels()):
-        if i % n != 0:
-            label.set_visible(False)
-
-    plt.tight_layout()
-
-    output_file3 = f"{filename_base}_lines.png"
-    plt.savefig(output_file3, dpi=300, bbox_inches="tight")
-    print(f"✓ Lines changed graph saved to {output_file3}")
+    print(f"\n✓ Dashboard saved to {output_file}")
 
     # Print statistics
-    print(f"\n📊 Statistics:")
+    print("\n📊 Statistics:")
     print(f"Total {interval}s analyzed: {len(df)}")
     print(
         f"Date range: {df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
     )
-    print(f"\nTotal commits and lines by author (sorted by commits):")
+    print("\nTotal commits and lines by author (sorted by commits):")
     for author in author_totals.index:
-        commits = int(author_totals[author])
+        commit_count = int(author_totals[author])
         lines = int(author_lines_totals[author])
-        avg_lines = lines // commits if commits > 0 else 0
-        print(f"  {author}: {commits:,} commits, {lines:,} lines ({avg_lines:,} avg lines/commit)")
-    print(f"\nGrand total: {int(df.sum().sum()):,} commits, {int(df_lines.sum().sum()):,} lines changed")
+        avg_lines = lines // commit_count if commit_count > 0 else 0
+        print(f"  {author}: {commit_count:,} commits, {lines:,} lines ({avg_lines:,} avg lines/commit)")
+    print(f"\nGrand total: {total_commits:,} commits, {total_lines:,} lines changed")
 
 
 def main() -> None:
@@ -469,9 +534,9 @@ Period formats:
     print(f"✓ Aggregated into {len(aggregated_commits)} {args.interval}s")
 
     print("\nCreating visualizations...")
-    create_visualization(aggregated_commits, aggregated_lines, args.interval, args.period, repo_name)
+    create_visualization(aggregated_commits, aggregated_lines, commits, args.interval, args.period, repo_name)
 
-    print("\n✅ Done! Check the generated PNG files.")
+    print("\n✅ Done! Check the generated PNG file.")
 
 
 if __name__ == "__main__":
