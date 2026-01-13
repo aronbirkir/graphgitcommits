@@ -91,7 +91,7 @@ def get_first_name(author: str) -> str:
     return author.split()[0] if author.split() else author
 
 
-def build_name_map(raw_commits: List[Tuple[str, datetime]]) -> Dict[str, str]:
+def build_name_map(raw_commits: List[Tuple[str, datetime, int]]) -> Dict[str, str]:
     """
     Build a dynamic mapping from ASCII-normalized first names to canonical display names.
     Picks the most common variation as the canonical form, preferring properly accented versions.
@@ -99,7 +99,7 @@ def build_name_map(raw_commits: List[Tuple[str, datetime]]) -> Dict[str, str]:
     # Count occurrences of each (ascii_name, original_first_name) pair
     name_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    for author, _ in raw_commits:
+    for author, _, _ in raw_commits:
         first_name = get_first_name(author)
         ascii_name = to_ascii(first_name)
         name_counts[ascii_name][first_name] += 1
@@ -121,9 +121,10 @@ def build_name_map(raw_commits: List[Tuple[str, datetime]]) -> Dict[str, str]:
     return name_map
 
 
-def get_git_commits(since: datetime | None = None) -> List[Tuple[str, datetime]]:
-    """Get git commits with author and date, optionally filtered by date."""
-    cmd = ["git", "log", "--pretty=format:%an|%ad", "--date=iso", "--all"]
+def get_git_commits(since: datetime | None = None) -> List[Tuple[str, datetime, int]]:
+    """Get git commits with author, date, and lines changed, optionally filtered by date."""
+    # Use a format that includes commit hash as separator for numstat parsing
+    cmd = ["git", "log", "--pretty=format:COMMIT|%an|%ad", "--date=iso", "--numstat", "--all"]
 
     if since:
         cmd.append(f"--since={since.strftime('%Y-%m-%d')}")
@@ -135,43 +136,73 @@ def get_git_commits(since: datetime | None = None) -> List[Tuple[str, datetime]]
         check=True,
     )
 
-    # First pass: collect raw commits
-    raw_commits: List[Tuple[str, datetime]] = []
+    # Parse commits with their numstat data
+    raw_commits: List[Tuple[str, datetime, int]] = []
+    current_author = None
+    current_date = None
+    current_lines = 0
+
     for line in result.stdout.strip().split("\n"):
         if not line:
             continue
-        author, date_str = line.split("|", 1)
-        date = datetime.fromisoformat(date_str.rsplit(" ", 1)[0])
-        if since and date < since:
-            break
-        raw_commits.append((author, date))
+        if line.startswith("COMMIT|"):
+            # Save previous commit if exists
+            if current_author is not None and current_date is not None:
+                if since is None or current_date >= since:
+                    raw_commits.append((current_author, current_date, current_lines))
+            # Parse new commit
+            parts = line.split("|", 2)
+            current_author = parts[1]
+            date_str = parts[2]
+            current_date = datetime.fromisoformat(date_str.rsplit(" ", 1)[0])
+            current_lines = 0
+        else:
+            # This is a numstat line: additions<tab>deletions<tab>filename
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                try:
+                    # Handle binary files which show '-' instead of numbers
+                    additions = int(parts[0]) if parts[0] != '-' else 0
+                    deletions = int(parts[1]) if parts[1] != '-' else 0
+                    current_lines += additions + deletions
+                except ValueError:
+                    pass
+
+    # Don't forget the last commit
+    if current_author is not None and current_date is not None:
+        if since is None or current_date >= since:
+            raw_commits.append((current_author, current_date, current_lines))
 
     # Build dynamic name mapping
     name_map = build_name_map(raw_commits)
 
     # Second pass: normalize names
-    commits: List[Tuple[str, datetime]] = []
-    for author, date in raw_commits:
+    commits: List[Tuple[str, datetime, int]] = []
+    for author, date, lines_changed in raw_commits:
         first_name = get_first_name(author)
         ascii_name = to_ascii(first_name)
         canonical_name = name_map.get(ascii_name, first_name.capitalize())
-        commits.append((canonical_name, date))
+        commits.append((canonical_name, date, lines_changed))
 
     return commits
 
 
 def aggregate_commits(
-    commits: List[Tuple[str, datetime]], interval: str = "week"
-) -> Dict[str, Dict[str, int]]:
+    commits: List[Tuple[str, datetime, int]], interval: str = "week"
+) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
     """Aggregate commits by user and time interval.
 
     Args:
-        commits: List of (author, date) tuples
+        commits: List of (author, date, lines_changed) tuples
         interval: One of 'week', 'month', 'quarter', 'year'
-    """
-    aggregated: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    for author, date in commits:
+    Returns:
+        Tuple of (commit_counts, lines_changed) aggregated dictionaries
+    """
+    commit_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    lines_changed: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for author, date, lines in commits:
         if interval == "week":
             # Get the start of the week (Monday)
             period_start = date - pd.Timedelta(days=date.weekday())
@@ -188,26 +219,31 @@ def aggregate_commits(
                 f"Invalid interval: {interval}. Use 'week', 'month', 'quarter', or 'year'"
             )
 
-        aggregated[period_key][author] += 1
+        commit_counts[period_key][author] += 1
+        lines_changed[period_key][author] += lines
 
-    return aggregated
+    return commit_counts, lines_changed
 
 
 def create_visualization(
     aggregated_commits: Dict[str, Dict[str, int]],
+    aggregated_lines: Dict[str, Dict[str, int]],
     interval: str = "week",
     period: str | None = None,
     repo_name: str = "repo",
 ) -> None:
-    """Create a stacked bar chart of commits by user and time interval."""
-    # Convert to DataFrame for easier plotting
+    """Create visualizations of commits and lines changed by user and time interval."""
+    # Convert to DataFrames for easier plotting
     df = pd.DataFrame(aggregated_commits).T.fillna(0)
+    df_lines = pd.DataFrame(aggregated_lines).T.fillna(0)
 
     # Sort index appropriately based on interval
     if interval == "week":
         df.index = pd.to_datetime(df.index)
+        df_lines.index = pd.to_datetime(df_lines.index)
     elif interval == "month":
         df.index = pd.to_datetime(df.index + "-01")
+        df_lines.index = pd.to_datetime(df_lines.index + "-01")
     elif interval == "quarter":
 
         def parse_quarter(q: str) -> datetime:
@@ -216,18 +252,24 @@ def create_visualization(
             return datetime(int(year), month, 1)
 
         df.index = pd.to_datetime([parse_quarter(q) for q in df.index])
+        df_lines.index = pd.to_datetime([parse_quarter(q) for q in df_lines.index])
     elif interval == "year":
         df.index = pd.to_datetime(df.index + "-01-01")
+        df_lines.index = pd.to_datetime(df_lines.index + "-01-01")
 
     df = df.sort_index()
+    df_lines = df_lines.sort_index()
 
     # Sort columns by total commits (highest first)
     author_totals = df.sum().sort_values(ascending=False)
+    author_lines_totals = df_lines.sum()
     df = df[author_totals.index]
+    df_lines = df_lines[author_totals.index]  # Same order as commits
 
-    # Create legend labels with commit counts
+    # Create legend labels with commit counts and lines
     legend_labels = [
-        f"{author} ({int(author_totals[author]):,})" for author in df.columns
+        f"{author} ({int(author_totals[author]):,} commits, {int(author_lines_totals[author]):,} lines)"
+        for author in df.columns
     ]
 
     # Create figure
@@ -324,17 +366,47 @@ def create_visualization(
     plt.savefig(output_file2, dpi=300, bbox_inches="tight")
     print(f"✓ Trend graph saved to {output_file2}")
 
+    # Create a stacked bar chart for lines changed
+    fig3, ax3 = plt.subplots(figsize=(16, 8))
+
+    # Plot stacked bar chart for lines
+    df_lines.plot(kind="bar", stacked=True, ax=ax3, width=0.8)
+
+    ax3.set_title(
+        f"{repo_name} - Lines Changed by User and {interval_label}", fontsize=16, fontweight="bold"
+    )
+    ax3.set_xlabel(f"{interval_label} Starting", fontsize=12)
+    ax3.set_ylabel("Lines Changed", fontsize=12)
+    ax3.legend(legend_labels, title="Authors", bbox_to_anchor=(1.05, 1), loc="upper left")
+    ax3.grid(True, alpha=0.3, axis="y")
+
+    # Create x-axis labels (same as commits chart)
+    ax3.set_xticklabels(labels, rotation=45, ha="right")
+
+    # Only show every nth label
+    for i, label in enumerate(ax3.xaxis.get_ticklabels()):
+        if i % n != 0:
+            label.set_visible(False)
+
+    plt.tight_layout()
+
+    output_file3 = f"{filename_base}_lines.png"
+    plt.savefig(output_file3, dpi=300, bbox_inches="tight")
+    print(f"✓ Lines changed graph saved to {output_file3}")
+
     # Print statistics
     print(f"\n📊 Statistics:")
     print(f"Total {interval}s analyzed: {len(df)}")
     print(
         f"Date range: {df.index.min().strftime('%Y-%m-%d')} to {df.index.max().strftime('%Y-%m-%d')}"
     )
-    print(f"\nTotal commits by author (sorted by commits):")
+    print(f"\nTotal commits and lines by author (sorted by commits):")
     for author in author_totals.index:
-        total = int(author_totals[author])
-        print(f"  {author}: {total:,} commits")
-    print(f"\nGrand total: {int(df.sum().sum()):,} commits")
+        commits = int(author_totals[author])
+        lines = int(author_lines_totals[author])
+        avg_lines = lines // commits if commits > 0 else 0
+        print(f"  {author}: {commits:,} commits, {lines:,} lines ({avg_lines:,} avg lines/commit)")
+    print(f"\nGrand total: {int(df.sum().sum()):,} commits, {int(df_lines.sum().sum()):,} lines changed")
 
 
 def main() -> None:
@@ -393,11 +465,11 @@ Period formats:
     print(f"✓ Found {len(commits):,} commits")
 
     print(f"\nAggregating by {args.interval}...")
-    aggregated = aggregate_commits(commits, args.interval)
-    print(f"✓ Aggregated into {len(aggregated)} {args.interval}s")
+    aggregated_commits, aggregated_lines = aggregate_commits(commits, args.interval)
+    print(f"✓ Aggregated into {len(aggregated_commits)} {args.interval}s")
 
     print("\nCreating visualizations...")
-    create_visualization(aggregated, args.interval, args.period, repo_name)
+    create_visualization(aggregated_commits, aggregated_lines, args.interval, args.period, repo_name)
 
     print("\n✅ Done! Check the generated PNG files.")
 
